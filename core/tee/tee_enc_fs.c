@@ -54,26 +54,6 @@ struct tee_enc_fs_private {
 	uint8_t *data;
 };
 
-static int get_file_length(struct tee_fs_fd *fdp, size_t *length)
-{
-	size_t file_len;
-	int res;
-
-	*length = 0;
-
-	res = tee_fs_common_lseek(fdp, 0, TEE_FS_SEEK_END);
-	if (res < 0)
-		return res;
-	file_len = res;
-
-	res = tee_fs_common_lseek(fdp, 0, TEE_FS_SEEK_SET);
-	if (res < 0)
-		return res;
-
-	*length = file_len;
-	return 0;
-}
-
 static int update_file_size(struct tee_enc_fs_private *priv,
 		size_t new_file_len)
 {
@@ -108,7 +88,7 @@ static int tee_enc_fs_open(const char *file, int flags, ...)
 	struct tee_enc_fs_private *priv;
 	TEE_Result ret;
 
-	DMSG("open, file=%s, flags=%x", file, flags);
+	DMSG("file=%s, flags=%x", file, flags);
 	open_flags = TEE_FS_O_RDWR;
 	if (flags & TEE_FS_O_CREATE)
 		open_flags |= TEE_FS_O_CREATE;
@@ -134,10 +114,23 @@ static int tee_enc_fs_open(const char *file, int flags, ...)
 		return fd;
 	}
 
-	res = get_file_length(fdp, &encrypted_data_len);
+	res = tee_fs_get_file_length(fdp, &encrypted_data_len);
 	if (res < 0) {
 		res = -1;
 		goto exit_close_file;
+	}
+
+    /*
+     * If we have created a new file and the volume has run
+     * out of space then that can leave us with an existing
+     * file with 0 length that's not caught by the
+     * fdp->is_new_file check above.
+     */
+	if (encrypted_data_len == 0) {
+		priv->len = 0;
+		priv->pos = 0;
+		priv->data = NULL;
+		return fd;
 	}
 
 	/*
@@ -178,6 +171,7 @@ static int tee_enc_fs_open(const char *file, int flags, ...)
 	ret = tee_enc_fs_file_decryption(encrypted_data, encrypted_data_len,
 			priv->data, &file_len);
 	if (ret != TEE_SUCCESS) {
+		EMSG("Decryption failed, ret=0x%x", ret);
 		res = -1;
 		goto exit_free_decrypted_data;
 	}
@@ -192,6 +186,7 @@ exit_close_file:
 	if (res < 0 && fd >= 0)
 		tee_fs_common_close(fdp);
 exit:
+	DMSG("res=%d", res);
 	return res;
 }
 
@@ -228,9 +223,13 @@ static int tee_enc_fs_close(int fd)
 	if (res < 0)
 		goto exit_free_encrypted_data;
 
-	res = tee_fs_common_ftruncate(fdp, encrypted_data_len);
+#ifndef CFG_RPMB_FS
+
+	res = tee_fs_common_ftruncate(fdp, 0);
 	if (res < 0)
 		goto exit_free_encrypted_data;
+
+#endif
 
 	/* write encrypted file content to normal world file system */
 	res = tee_fs_common_write(fdp, encrypted_data,
@@ -370,7 +369,7 @@ static tee_fs_off_t tee_enc_fs_lseek(int fd, tee_fs_off_t offset, int whence)
 	 * restrict the file postion within file length
 	 * for simplicity
 	 */
-	if ((new_pos < 0) || (new_pos > (tee_fs_off_t)priv->len))
+	if (new_pos > (tee_fs_off_t)priv->len)
 		goto exit;
 
 	res = priv->pos = new_pos;
